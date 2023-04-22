@@ -1,8 +1,10 @@
 FROM caddy:builder-alpine AS builder
 
-RUN xcaddy build \
-    --with github.com/caddyserver/forwardproxy@caddy2=github.com/ghostGPT/forwardproxy@naive \
-    --with github.com/mholt/caddy-grpc-web@master=github.com/ghostGPT/caddy-grpc-web@master
+RUN git clone --single-branch --branch=naive --depth=1 https://github.com/ghostGPT/forwardproxy.git /tmp/forwardproxy && \
+    git clone --single-branch --branch=master --depth=1 https://github.com/ghostGPT/caddy-grpc-web.git /tmp/grpc-web && \
+    xcaddy build \
+      --with github.com/caddyserver/forwardproxy=/tmp/forwardproxy \
+      --with github.com/mholt/caddy-grpc-web=/tmp/grpc-web
 
 FROM caddy:alpine
 
