@@ -20,13 +20,12 @@ import (
 	"bufio"
 	"bytes"
 	"context"
-	"crypto/subtle"
 	"crypto/tls"
 	"encoding/base64"
 	"errors"
 	"fmt"
 	"io"
-	"io/ioutil"
+	"log"
 	"math/rand"
 	"net"
 	"net/http"
@@ -41,16 +40,46 @@ import (
 	"github.com/caddyserver/caddy/v2/caddyconfig/caddyfile"
 	"github.com/caddyserver/caddy/v2/modules/caddyhttp"
 	"github.com/caddyserver/forwardproxy/httpclient"
+	"github.com/caddyserver/forwardproxy/proto"
+	"github.com/samber/lo"
+	"github.com/samber/mo"
 	"go.uber.org/zap"
 	"golang.org/x/net/proxy"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials"
 )
 
 func init() {
-	caddy.RegisterModule(Handler{})
+	caddy.RegisterModule(Handler{
+		usersLock:         new(sync.RWMutex),
+		users:             make(map[string]*UserData),
+		dataUsageCh:       make(chan DataUsage, 2000),
+		dataUsageStatLock: new(sync.Mutex),
+		dataUsageStat:     make(map[string]uint64),
+	})
 
 	// Used for generating padding lengths. Not needed to be cryptographically secure.
 	// Does not care about double seeding.
 	rand.Seed(time.Now().UnixNano())
+}
+
+type DataUsage struct {
+	UserId string
+	Usage  uint64
+}
+
+type UserConn struct {
+	target net.Conn
+	client io.Writer
+}
+
+type UserData struct {
+	dataRemainingLock sync.Mutex
+	dataRemaining     uint64
+	authKey           string
+	// TODO 连接管理
+	connsLock sync.Mutex
+	conns     map[string]map[string]UserConn
 }
 
 // Handler implements a forward proxy.
@@ -95,11 +124,16 @@ type Handler struct {
 
 	aclRules []aclRule
 
-	// TODO: temporary/deprecated - we should try to reuse existing authentication modules instead!
-	BasicauthUser   string `json:"auth_user_deprecated,omitempty"`
-	BasicauthPass   string `json:"auth_pass_deprecated,omitempty"`
-	authRequired    bool
-	authCredentials [][]byte // slice with base64-encoded credentials
+	grpcServer string
+	serverId   string
+	secretKey  string
+
+	dashboardClient   proto.DashboardClient
+	usersLock         *sync.RWMutex
+	users             map[string]*UserData
+	dataUsageCh       chan DataUsage
+	dataUsageStatLock *sync.Mutex
+	dataUsageStat     map[string]uint64
 }
 
 // CaddyModule returns the Caddy module information.
@@ -123,14 +157,6 @@ func (h *Handler) Provision(ctx caddy.Context) error {
 		MaxIdleConns:        50,
 		IdleConnTimeout:     60 * time.Second,
 		TLSHandshakeTimeout: 10 * time.Second,
-	}
-
-	// TODO: temporary, in an effort to get the tests to pass
-	if h.BasicauthUser != "" && h.BasicauthPass != "" {
-		basicAuthBuf := make([]byte, base64.StdEncoding.EncodedLen(len(h.BasicauthUser)+1+len(h.BasicauthPass)))
-		base64.StdEncoding.Encode(basicAuthBuf, []byte(h.BasicauthUser+":"+h.BasicauthPass))
-		h.authRequired = true
-		h.authCredentials = [][]byte{basicAuthBuf}
 	}
 
 	// access control lists
@@ -159,13 +185,8 @@ func (h *Handler) Provision(ctx caddy.Context) error {
 	}
 	h.aclRules = append(h.aclRules, &aclAllRule{allow: true})
 
-	if h.ProbeResistance != nil {
-		if !h.authRequired {
-			return fmt.Errorf("probe resistance requires authentication")
-		}
-		if len(h.ProbeResistance.Domain) > 0 {
-			h.logger.Info("Secret domain used to connect to proxy: " + h.ProbeResistance.Domain)
-		}
+	if h.ProbeResistance != nil && len(h.ProbeResistance.Domain) > 0 {
+		h.logger.Info("Secret domain used to connect to proxy: " + h.ProbeResistance.Domain)
 	}
 
 	dialer := &net.Dialer{
@@ -231,7 +252,148 @@ func (h *Handler) Provision(ctx caddy.Context) error {
 		}
 	}
 
+	grpcConn, err := grpc.Dial(h.grpcServer, grpc.WithTransportCredentials(credentials.NewTLS(&tls.Config{MinVersion: tls.VersionTLS12})), grpc.WithPerRPCCredentials(NewGRPCAuthentication(h.serverId, h.secretKey)))
+	if err != nil {
+		return err
+	}
+
+	h.dashboardClient = proto.NewDashboardClient(grpcConn)
+
+	go h.handleUsersUpdate()
+	go h.reportDataUsage()
+
 	return nil
+}
+
+func (h *Handler) reportDataUsage() {
+	h.logger.Info("Start reporting data usage")
+	defer h.logger.Info("Stop reporting data usage")
+	stream, err := h.dashboardClient.UsageStramingUpdate(context.Background())
+	if err != nil {
+		h.logger.Fatal("Error report data usage", zap.Error(err))
+		return
+	}
+	ticker := time.NewTicker(time.Second * 10)
+	for {
+		select {
+		case <-ticker.C:
+			var list []*proto.Usage
+			h.dataUsageStatLock.Lock()
+			for userId, used := range h.dataUsageStat {
+				var usage proto.Usage
+				usage.UserId = userId
+				usage.DataUsed = used
+				list = append(list, &usage)
+				h.dataUsageStat[userId] = 0
+			}
+			h.dataUsageStatLock.Unlock()
+			stream.Send(&proto.RepeatedUsage{Usages: list})
+		case data := <-h.dataUsageCh:
+			h.dataUsageStatLock.Lock()
+			if _, has := h.dataUsageStat[data.UserId]; has {
+				h.dataUsageStat[data.UserId], _ = SafeMath.Add(h.dataUsageStat[data.UserId], data.Usage)
+			}
+			h.dataUsageStatLock.Unlock()
+		}
+	}
+}
+
+func (h *Handler) handleUsersUpdate() {
+	h.logger.Info("Start getting users update")
+	defer h.logger.Info("Stop getting users update")
+	usersUpdate, err := h.dashboardClient.UserStramingUpdate(context.Background(), &proto.Empty{})
+	if err != nil {
+		h.logger.Fatal("Error getting users update", zap.Error(err))
+		return
+	}
+	for {
+		msg, err := usersUpdate.Recv()
+		if err != nil {
+			log.Fatalln("Error getting users update: ", err)
+			return
+		}
+		users := msg.GetUsers()
+		h.logger.Info("Users update", zap.Any("users", users))
+
+		var wg sync.WaitGroup
+		wg.Add(len(users))
+
+		for _, user := range users {
+			userId := user.GetUserId()
+			userAuthKey := user.GetAuthKey()
+			dataRemaining := user.GetDataRemaining()
+			go lo.Try(func() error {
+				defer wg.Done()
+				// 如果没有用户，添加用户
+				h.usersLock.RLock()
+				data, has := h.users[userId]
+				h.usersLock.RUnlock()
+				if !has {
+					// 新增用户
+					h.usersLock.Lock()
+					h.dataUsageStatLock.Lock()
+					h.users[userId] = &UserData{
+						dataRemaining: dataRemaining,
+						authKey:       userAuthKey,
+						conns:         make(map[string]map[string]UserConn),
+					}
+					h.dataUsageStat[userId] = 0
+					h.dataUsageStatLock.Unlock()
+					h.usersLock.Unlock()
+					return nil
+				}
+				data.dataRemaining = dataRemaining
+				// 如果用户流量用完或密码发生了改变，踢出所有连接
+				if data.dataRemaining == 0 || data.authKey != userAuthKey {
+					data.connsLock.Lock()
+					for _, conns := range data.conns {
+						for _, conn := range conns {
+							conn.target.Close()
+							if cw, ok := conn.client.(closeWriter); ok {
+								cw.CloseWrite()
+							}
+							if cw, ok := conn.client.(io.Closer); ok {
+								cw.Close()
+							}
+						}
+					}
+					data.conns = make(map[string]map[string]UserConn)
+					data.connsLock.Unlock()
+				}
+				// 如果用户流量用完，删除用户
+				if data.dataRemaining == 0 {
+					// 删除用户
+					h.usersLock.Lock()
+					h.dataUsageStatLock.Lock()
+					delete(h.users, userId)
+					delete(h.dataUsageStat, userId)
+					h.dataUsageStatLock.Unlock()
+					h.usersLock.Unlock()
+				}
+				return nil
+			})
+		}
+
+		wg.Wait()
+	}
+}
+
+func (h *Handler) logDataUsage(userId string, dataUsed uint64) error {
+	h.usersLock.RLock()
+	defer h.usersLock.RUnlock()
+	user, ok := h.users[userId]
+	if !ok {
+		return errors.New("user not found")
+	}
+	user.dataRemainingLock.Lock()
+	defer user.dataRemainingLock.Unlock()
+	var err error
+	user.dataRemaining, err = SafeMath.Sub(user.dataRemaining, dataUsed)
+	h.dataUsageCh <- DataUsage{
+		UserId: userId,
+		Usage:  dataUsed,
+	}
+	return err
 }
 
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyhttp.Handler) error {
@@ -241,14 +403,11 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 		reqHost = r.Host // OK; probably just didn't have a port
 	}
 
-	var authErr error
-	if h.authRequired {
-		authErr = h.checkCredentials(r)
-	}
+	userAuthRet := h.checkCredentials(r)
 	if h.ProbeResistance != nil && len(h.ProbeResistance.Domain) > 0 && reqHost == h.ProbeResistance.Domain {
-		return serveHiddenPage(w, authErr)
+		return serveHiddenPage(w, userAuthRet.Error())
 	}
-	if h.Hosts.Match(r) && (r.Method != http.MethodConnect || authErr != nil) {
+	if h.Hosts.Match(r) && (r.Method != http.MethodConnect || userAuthRet.IsError()) {
 		// Always pass non-CONNECT requests to hostname
 		// Pass CONNECT requests only if probe resistance is enabled and not authenticated
 		if h.shouldServePACFile(r) {
@@ -256,14 +415,14 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 		}
 		return next.ServeHTTP(w, r)
 	}
-	if authErr != nil {
+	if userAuthRet.IsError() {
 		if h.ProbeResistance != nil {
 			// probe resistance is requested and requested URI does not match secret domain;
 			// act like this proxy handler doesn't even exist (pass thru to next handler)
 			return next.ServeHTTP(w, r)
 		}
 		w.Header().Set("Proxy-Authenticate", "Basic realm=\"Caddy Secure Web Proxy\"")
-		return caddyhttp.Error(http.StatusProxyAuthRequired, authErr)
+		return caddyhttp.Error(http.StatusProxyAuthRequired, userAuthRet.Error())
 	}
 
 	if r.ProtoMajor != 1 && r.ProtoMajor != 2 && r.ProtoMajor != 3 {
@@ -331,12 +490,12 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 
 		switch r.ProtoMajor {
 		case 1: // http1: hijack the whole flow
-			return serveHijack(w, targetConn)
+			return h.serveHijack(userAuthRet.MustGet(), w, targetConn)
 		case 2: // http2: keep reading from "request" and writing into same response
 			fallthrough
 		case 3:
 			defer r.Body.Close()
-			return dualStream(targetConn, r.Body, w, r.Header.Get("Padding") != "")
+			return h.dualStream(userAuthRet.MustGet(), r.RemoteAddr, targetConn, r.Body, w, r.Header.Get("Padding") != "")
 		}
 
 		panic("There was a check for http version, yet it's incorrect")
@@ -375,13 +534,13 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 			// make sure request is idempotent and could be retried by saving the Body
 			// None of those methods are supposed to have body,
 			// but we still need to copy the r.Body, even if it's empty
-			rBodyBuf, err := ioutil.ReadAll(r.Body)
+			rBodyBuf, err := io.ReadAll(r.Body)
 			if err != nil {
 				return caddyhttp.Error(http.StatusBadRequest,
 					fmt.Errorf("failed to read request body: %v", err))
 			}
 			r.GetBody = func() (io.ReadCloser, error) {
-				return ioutil.NopCloser(bytes.NewReader(rBodyBuf)), nil
+				return io.NopCloser(bytes.NewReader(rBodyBuf)), nil
 			}
 			r.Body, _ = r.GetBody()
 		}
@@ -430,23 +589,32 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 	return forwardResponse(w, response)
 }
 
-func (h Handler) checkCredentials(r *http.Request) error {
+func (h *Handler) checkCredentials(r *http.Request) mo.Result[string] {
 	pa := strings.Split(r.Header.Get("Proxy-Authorization"), " ")
 	if len(pa) != 2 {
-		return errors.New("Proxy-Authorization is required! Expected format: <type> <credentials>")
+		return mo.Err[string](errors.New("Proxy-Authorization is required! Expected format: <type> <credentials>"))
 	}
 	if strings.ToLower(pa[0]) != "basic" {
-		return errors.New("Auth type is not supported")
+		return mo.Err[string](errors.New("auth type is not supported"))
 	}
-	for _, creds := range h.authCredentials {
-		if subtle.ConstantTimeCompare(creds, []byte(pa[1])) == 1 {
-			// Please do not consider this to be timing-attack-safe code. Simple equality is almost
-			// mindlessly substituted with constant time algo and there ARE known issues with this code,
-			// e.g. size of smallest credentials is guessable. TODO: protect from all the attacks! Hash?
-			return nil
+
+	credentials, err := base64.RawStdEncoding.DecodeString(pa[1])
+	if err == nil {
+		userId, userAuthKey, ok := strings.Cut(string(credentials), ":")
+		if ok {
+			h.usersLock.RLock()
+			defer h.usersLock.RUnlock()
+			data, has := h.users[userId]
+			if has && data.authKey == userAuthKey {
+				if data.dataRemaining == 0 {
+					return mo.Err[string](errors.New("user has no data remaining"))
+				}
+				return mo.Ok(userId)
+			}
 		}
 	}
-	return errors.New("Invalid credentials")
+
+	return mo.Err[string](errors.New("invalid credentials"))
 }
 
 func (h Handler) shouldServePACFile(r *http.Request) bool {
@@ -577,7 +745,7 @@ func serveHiddenPage(w http.ResponseWriter, authErr error) error {
 
 // Hijacks the connection from ResponseWriter, writes the response and proxies data between targetConn
 // and hijacked connection.
-func serveHijack(w http.ResponseWriter, targetConn net.Conn) error {
+func (h *Handler) serveHijack(userId string, w http.ResponseWriter, targetConn net.Conn) error {
 	hijacker, ok := w.(http.Hijacker)
 	if !ok {
 		return caddyhttp.Error(http.StatusInternalServerError,
@@ -616,7 +784,7 @@ func serveHijack(w http.ResponseWriter, targetConn net.Conn) error {
 			fmt.Errorf("failed to send response to client: %v", err))
 	}
 
-	return dualStream(targetConn, clientConn, clientConn, false)
+	return h.dualStream(userId, clientConn.RemoteAddr().String(), targetConn, clientConn, clientConn, false)
 }
 
 const (
@@ -629,13 +797,41 @@ const (
 // Copies data target->clientReader and clientWriter->target, and flushes as needed
 // Returns when clientWriter-> target stream is done.
 // Caddy should finish writing target -> clientReader.
-func dualStream(target net.Conn, clientReader io.ReadCloser, clientWriter io.Writer, padding bool) error {
+func (h *Handler) dualStream(userId string, remoteAddr string, target net.Conn, clientReader io.ReadCloser, clientWriter io.Writer, padding bool) error {
+	// 新链接
+	h.usersLock.RLock()
+	user, ok := h.users[userId]
+	h.usersLock.RUnlock()
+	if !ok {
+		target.Close()
+		if cw, ok := clientWriter.(closeWriter); ok {
+			cw.CloseWrite()
+		}
+		return fmt.Errorf("user %s not found", userId)
+	}
+	user.connsLock.Lock()
+	if _, has := user.conns[userId]; !has {
+		user.conns[userId] = make(map[string]UserConn)
+	}
+	user.conns[userId][remoteAddr] = UserConn{
+		target: target,
+		client: clientWriter,
+	}
+	user.connsLock.Unlock()
+
+	// 链接关闭
+	defer func() {
+		user.connsLock.Lock()
+		delete(user.conns[userId], remoteAddr)
+		user.connsLock.Unlock()
+	}()
+
 	stream := func(w io.Writer, r io.Reader, paddingType int) error {
 		// copy bytes from r to w
 		buf := bufferPool.Get().([]byte)
 		buf = buf[0:cap(buf)]
-		_, _err := flushingIoCopy(w, r, buf, paddingType)
-		bufferPool.Put(buf)
+		_, _err := h.flushingIoCopy(userId, w, r, buf, paddingType)
+		bufferPool.Put(&buf)
 		if cw, ok := w.(closeWriter); ok {
 			cw.CloseWrite()
 		}
@@ -657,7 +853,7 @@ type closeWriter interface {
 // flushingIoCopy is analogous to buffering io.Copy(), but also attempts to flush on each iteration.
 // If dst does not implement http.Flusher(e.g. net.TCPConn), it will do a simple io.CopyBuffer().
 // Reasoning: http2ResponseWriter will not flush on its own, so we have to do it manually.
-func flushingIoCopy(dst io.Writer, src io.Reader, buf []byte, paddingType int) (written int64, err error) {
+func (h *Handler) flushingIoCopy(userId string, dst io.Writer, src io.Reader, buf []byte, paddingType int) (written int64, err error) {
 	flusher, hasFlusher := dst.(http.Flusher)
 	var numPadding int
 	for {
@@ -699,6 +895,8 @@ func flushingIoCopy(dst io.Writer, src io.Reader, buf []byte, paddingType int) (
 			}
 			if nw > 0 {
 				written += int64(nw)
+				// 扣减用户流量
+				h.logDataUsage(userId, uint64(nw))
 			}
 			if ew != nil {
 				err = ew
@@ -734,7 +932,7 @@ func forwardResponse(w http.ResponseWriter, response *http.Response) error {
 	buf := bufferPool.Get().([]byte)
 	buf = buf[0:cap(buf)]
 	_, err := io.CopyBuffer(w, response.Body, buf)
-	bufferPool.Put(buf)
+	bufferPool.Put(&buf)
 	return err
 }
 

@@ -1,16 +1,9 @@
-FROM alpine:3.6
+FROM caddy:builder-alpine AS builder
 
-LABEL description="Docker image for caddy+forwardproxy plugin."
-LABEL maintainer="SergeyFrolov@colorado.edu"
+RUN xcaddy build \
+    --with github.com/caddyserver/forwardproxy@caddy2=github.com/ghostGPT/forwardproxy@naive \
+    --with github.com/mholt/caddy-grpc-web
 
-RUN apk add --no-cache ca-certificates bash curl
+FROM caddy:alpine
 
-RUN curl --fail https://getcaddy.com | bash -s http.forwardproxy
-
-COPY gen_caddyfile_and_start.sh /bin/
-
-VOLUME /root/.caddy
-
-EXPOSE 80 443 2015
-
-ENTRYPOINT /bin/gen_caddyfile_and_start.sh
+COPY --from=builder /usr/bin/caddy /usr/bin/caddy

@@ -34,24 +34,6 @@ func (h *Handler) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 		subdirective := d.Val()
 		args := d.RemainingArgs()
 		switch subdirective {
-		case "basic_auth":
-			if len(args) != 2 {
-				return d.ArgErr()
-			}
-			if len(args[0]) == 0 {
-				return d.Err("empty usernames are not allowed")
-			}
-			// TODO: Evaluate policy of allowing empty passwords.
-			if strings.Contains(args[0], ":") {
-				return d.Err("character ':' in usernames is not allowed")
-			}
-			// TODO: Support multiple basicauths.
-			// TODO: Actually, just try to use Caddy 2's existing basicauth module.
-			if h.BasicauthUser != "" || h.BasicauthPass != "" {
-				return d.Err("Multi-user basicauth is not supported")
-			}
-			h.BasicauthUser = args[0]
-			h.BasicauthPass = args[1]
 		case "hosts":
 			if len(args) == 0 {
 				return d.ArgErr()
@@ -172,6 +154,34 @@ func (h *Handler) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 				}
 				ar := ACLRule{Subjects: ruleSubjects, Allow: aclAllow}
 				h.ACL = append(h.ACL, ar)
+			}
+		case "dashboard":
+			for nesting := d.Nesting(); d.NextBlock(nesting); {
+				directive := d.Val()
+				args := d.RemainingArgs()
+				if len(args) == 0 {
+					return d.ArgErr()
+				}
+				switch directive {
+				case "grpc":
+					if len(args) != 1 || args[0] == "" {
+						return d.Err("server directive expects a single non-empty argument")
+					}
+					h.grpcServer = args[0]
+				case "server_id":
+					if len(args) != 1 || args[0] == "" {
+						return d.Err("server_id directive expects a single non-empty argument")
+					}
+					h.serverId = args[0]
+				case "secret_key":
+					if len(args) != 1 || args[0] == "" {
+						return d.Err("secret_key directive expects a single non-empty argument")
+					}
+					h.secretKey = args[0]
+				default:
+					return d.Err("expected acl directive: grpc/server_id/secret_key." +
+						"got: " + directive)
+				}
 			}
 		default:
 			return d.ArgErr()

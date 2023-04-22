@@ -1,38 +1,36 @@
 name: Build
+
 on:
   push:
-    branches: [naive]
-    paths-ignore: [README.md]
-  release:
-    types: [published]
-defaults:
-  run:
-    shell: bash
+    branches: 
+      - naive
+  workflow_dispatch:
+
 jobs:
   build_caddy_with_naive:
-    runs-on: ubuntu-22.04
-    env:
-      BUNDLE: caddy-forwardproxy-naive
+    runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v2
-      - uses: actions/setup-go@v3
+      - uses: actions/checkout@v3
+
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@v2
         with:
-          go-version: ^1.18.1
-      - run: go install github.com/caddyserver/xcaddy/cmd/xcaddy@latest
-      - run: ~/go/bin/xcaddy build --with github.com/caddyserver/forwardproxy@caddy2=$PWD
-      - name: Pack naiveproxy assets
-        run: |
-          mkdir ${{ env.BUNDLE }}
-          cp caddy LICENSE README.md ${{ env.BUNDLE }}
-          tar cJf ${{ env.BUNDLE }}.tar.xz ${{ env.BUNDLE }}
-          openssl sha256 ./caddy >sha256sum.txt
-          echo "SHA256SUM=$(cut -d' ' -f2 sha256sum.txt)" >>$GITHUB_ENV
-      - uses: actions/upload-artifact@v2
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v2
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v2
+
+      - name: Build and push
+        uses: docker/build-push-action@v4
         with:
-          name: ${{ env.BUNDLE }}.tar.xz caddy executable sha256 ${{ env.SHA256SUM }}
-          path: sha256sum.txt
-      - name: Upload caddy assets
-        if: ${{ github.event_name == 'release' }}
-        run: hub release edit -a ${{ env.BUNDLE }}.tar.xz -m "" "${GITHUB_REF##*/}"
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          context: .
+          file: ./docker-build/Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: |
+            ghcr.io/${{ github.repository_owner }}/caddy:latest
