@@ -47,6 +47,7 @@ import (
 	"golang.org/x/net/proxy"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
+	"google.golang.org/grpc/credentials/insecure"
 )
 
 func init() {
@@ -77,9 +78,8 @@ type UserData struct {
 	dataRemainingLock sync.Mutex
 	dataRemaining     uint64
 	authKey           string
-	// TODO 连接管理
-	connsLock sync.Mutex
-	conns     map[string]map[string]UserConn
+	connsLock         sync.Mutex
+	conns             map[string]map[string]UserConn
 }
 
 // Handler implements a forward proxy.
@@ -127,6 +127,7 @@ type Handler struct {
 	grpcServer string
 	serverId   string
 	secretKey  string
+	useTLS     bool
 
 	dashboardClient   proto.DashboardClient
 	usersLock         *sync.RWMutex
@@ -252,7 +253,13 @@ func (h *Handler) Provision(ctx caddy.Context) error {
 		}
 	}
 
-	grpcConn, err := grpc.Dial(h.grpcServer, grpc.WithTransportCredentials(credentials.NewTLS(&tls.Config{MinVersion: tls.VersionTLS12})), grpc.WithPerRPCCredentials(NewGRPCAuthentication(h.serverId, h.secretKey)))
+	var securityOption grpc.DialOption
+	if h.useTLS {
+		securityOption = grpc.WithTransportCredentials(credentials.NewTLS(&tls.Config{MinVersion: tls.VersionTLS12}))
+	} else {
+		securityOption = grpc.WithTransportCredentials(insecure.NewCredentials())
+	}
+	grpcConn, err := grpc.Dial(h.grpcServer, securityOption, grpc.WithPerRPCCredentials(NewGRPCAuthentication(h.serverId, h.secretKey)))
 	if err != nil {
 		return err
 	}

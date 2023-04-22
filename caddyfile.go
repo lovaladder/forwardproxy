@@ -178,6 +178,11 @@ func (h *Handler) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 						return d.Err("secret_key directive expects a single non-empty argument")
 					}
 					h.secretKey = args[0]
+				case "use_tls":
+					if len(args) != 0 {
+						return d.ArgErr()
+					}
+					h.useTLS = true
 				default:
 					return d.Err("expected acl directive: grpc/server_id/secret_key." +
 						"got: " + directive)
