@@ -179,10 +179,11 @@ func (h *Handler) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 					}
 					h.SecretKey = args[0]
 				case "use_tls":
-					if len(args) != 0 {
+					log.Printf("%+v", args)
+					if len(args) != 1 {
 						return d.ArgErr()
 					}
-					h.UseTLS = true
+					h.UseTLS = args[0] == "true"
 				default:
 					return d.Err("expected acl directive: grpc/server_id/secret_key." +
 						"got: " + directive)

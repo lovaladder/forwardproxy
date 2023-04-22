@@ -8,12 +8,14 @@ import (
 type GRPCAuthentication struct {
 	Username string
 	Password string
+	UseTLS   bool
 }
 
-func NewGRPCAuthentication(username, password string) *GRPCAuthentication {
+func NewGRPCAuthentication(username, password string, useTLS bool) *GRPCAuthentication {
 	return &GRPCAuthentication{
 		Username: username,
 		Password: password,
+		UseTLS:   useTLS,
 	}
 }
 
@@ -24,5 +26,5 @@ func (g *GRPCAuthentication) GetRequestMetadata(ctx context.Context, uri ...stri
 }
 
 func (g *GRPCAuthentication) RequireTransportSecurity() bool {
-	return true
+	return g.UseTLS
 }

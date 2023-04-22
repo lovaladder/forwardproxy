@@ -25,7 +25,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log"
 	"math/rand"
 	"net"
 	"net/http"
@@ -47,18 +46,13 @@ import (
 	"go.uber.org/zap"
 	"golang.org/x/net/proxy"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/connectivity"
 	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/credentials/insecure"
 )
 
 func init() {
-	caddy.RegisterModule(Handler{
-		usersLock:         new(sync.RWMutex),
-		users:             make(map[string]*UserData),
-		dataUsageCh:       make(chan DataUsage, 2000),
-		dataUsageStatLock: new(sync.Mutex),
-		dataUsageStat:     make(map[string]uint64),
-	})
+	caddy.RegisterModule(Handler{})
 
 	// Used for generating padding lengths. Not needed to be cryptographically secure.
 	// Does not care about double seeding.
@@ -134,12 +128,15 @@ type Handler struct {
 	SecretKey  string `json:"secret_key,omitempty"`
 	UseTLS     bool   `json:"use_tls,omitempty"`
 
-	dashboardClient   proto.DashboardClient
-	usersLock         *sync.RWMutex
-	users             map[string]*UserData
-	dataUsageCh       chan DataUsage
-	dataUsageStatLock *sync.Mutex
-	dataUsageStat     map[string]uint64
+	reconnectCh         chan struct{}
+	reconnecting        bool
+	grpcContextCancelFn func()
+	dashboardClient     proto.DashboardClient
+	usersLock           *sync.RWMutex
+	users               map[string]*UserData
+	dataUsageCh         chan DataUsage
+	dataUsageStatLock   *sync.Mutex
+	dataUsageStat       map[string]uint64
 }
 
 // CaddyModule returns the Caddy module information.
@@ -153,6 +150,12 @@ func (Handler) CaddyModule() caddy.ModuleInfo {
 // Provision ensures that h is set up properly before use.
 func (h *Handler) Provision(ctx caddy.Context) error {
 	h.logger = ctx.Logger(h)
+	h.usersLock = new(sync.RWMutex)
+	h.users = make(map[string]*UserData)
+	h.dataUsageCh = make(chan DataUsage, 2000)
+	h.dataUsageStatLock = new(sync.Mutex)
+	h.dataUsageStat = make(map[string]uint64)
+	h.reconnectCh = make(chan struct{})
 
 	if h.DialTimeout <= 0 {
 		h.DialTimeout = caddy.Duration(30 * time.Second)
@@ -258,40 +261,91 @@ func (h *Handler) Provision(ctx caddy.Context) error {
 		}
 	}
 
+	go h.reconnectDashboard()
+	h.reconnectCh <- struct{}{}
+
+	return nil
+}
+
+func (h *Handler) innerReconnectDashboard() {
+	defer func() {
+		h.reconnecting = false
+	}()
+	h.logger.Info("Reconnecting to dashboard")
+
 	var securityOption grpc.DialOption
 	if h.UseTLS {
 		securityOption = grpc.WithTransportCredentials(credentials.NewTLS(&tls.Config{MinVersion: tls.VersionTLS12}))
 	} else {
 		securityOption = grpc.WithTransportCredentials(insecure.NewCredentials())
 	}
-	grpcConn, err := grpc.Dial(h.GrpcServer, securityOption, grpc.WithPerRPCCredentials(NewGRPCAuthentication(h.ServerId, h.SecretKey)))
-	if err != nil {
-		return err
+
+	var grpcConn *grpc.ClientConn
+	var err error
+OUTER:
+	for {
+		grpcConn, err = grpc.Dial(h.GrpcServer, securityOption, grpc.WithPerRPCCredentials(NewGRPCAuthentication(h.ServerId, h.SecretKey, h.UseTLS)))
+		if err == nil {
+			for i := 0; i < 3; i++ {
+				if grpcConn.GetState() == connectivity.Ready {
+					break OUTER
+				}
+				time.Sleep(time.Second)
+			}
+			err = errors.New("grpc connection is not ready")
+			grpcConn.Close()
+		}
+		h.logger.Error("Error connecting to dashboard", zap.Error(err))
 	}
 
 	h.dashboardClient = proto.NewDashboardClient(grpcConn)
 
-	go h.handleUsersUpdate()
-	go h.reportDataUsage()
+	ctx, cancel := context.WithCancel(context.Background())
+	h.grpcContextCancelFn = cancel
 
-	return nil
+	go h.handleUsersUpdate(ctx)
+	go h.reportDataUsage(ctx)
 }
 
-func (h *Handler) reportDataUsage() {
+func (h *Handler) reconnectDashboard() {
+	for range h.reconnectCh {
+		if h.reconnecting {
+			continue
+		}
+		h.reconnecting = true
+		if h.grpcContextCancelFn != nil {
+			h.grpcContextCancelFn()
+			h.grpcContextCancelFn = nil
+		}
+		go h.innerReconnectDashboard()
+	}
+}
+
+func (h *Handler) reportDataUsage(ctx context.Context) {
 	h.logger.Info("Start reporting data usage")
+	defer func() {
+		h.reconnectCh <- struct{}{}
+	}()
 	defer h.logger.Info("Stop reporting data usage")
-	stream, err := h.dashboardClient.UsageStramingUpdate(context.Background())
+
+	stream, err := h.dashboardClient.UsageStramingUpdate(ctx)
 	if err != nil {
-		h.logger.Fatal("Error report data usage", zap.Error(err))
+		h.logger.Error("Error report data usage init", zap.Error(err))
 		return
 	}
 	ticker := time.NewTicker(time.Second * 10)
+	defer ticker.Stop()
 	for {
 		select {
+		case <-ctx.Done():
+			return
 		case <-ticker.C:
 			var list []*proto.Usage
 			h.dataUsageStatLock.Lock()
 			for userId, used := range h.dataUsageStat {
+				if used == 0 {
+					continue
+				}
 				var usage proto.Usage
 				usage.UserId = userId
 				usage.DataUsed = used
@@ -299,7 +353,14 @@ func (h *Handler) reportDataUsage() {
 				h.dataUsageStat[userId] = 0
 			}
 			h.dataUsageStatLock.Unlock()
-			stream.Send(&proto.RepeatedUsage{Usages: list})
+			if len(list) > 0 {
+				h.logger.Info("Report data usage", zap.Int("count", len(list)))
+				err := stream.Send(&proto.RepeatedUsage{Usages: list})
+				if err != nil {
+					h.logger.Error("Error report data usage send", zap.Error(err))
+					return
+				}
+			}
 		case data := <-h.dataUsageCh:
 			h.dataUsageStatLock.Lock()
 			if _, has := h.dataUsageStat[data.UserId]; has {
@@ -310,18 +371,21 @@ func (h *Handler) reportDataUsage() {
 	}
 }
 
-func (h *Handler) handleUsersUpdate() {
+func (h *Handler) handleUsersUpdate(ctx context.Context) {
 	h.logger.Info("Start getting users update")
+	defer func() {
+		h.reconnectCh <- struct{}{}
+	}()
 	defer h.logger.Info("Stop getting users update")
-	usersUpdate, err := h.dashboardClient.UserStramingUpdate(context.Background(), &proto.Empty{})
+	usersUpdate, err := h.dashboardClient.UserStramingUpdate(ctx, &proto.Empty{})
 	if err != nil {
-		h.logger.Fatal("Error getting users update", zap.Error(err))
+		h.logger.Error("Error getting users update init", zap.Error(err))
 		return
 	}
 	for {
 		msg, err := usersUpdate.Recv()
 		if err != nil {
-			log.Fatalln("Error getting users update: ", err)
+			h.logger.Error("Error getting users update recv: ", zap.Error(err))
 			return
 		}
 		users := msg.GetUsers()
