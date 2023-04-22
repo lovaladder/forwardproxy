@@ -4,6 +4,7 @@ go 1.19
 
 require (
 	github.com/caddyserver/caddy/v2 v2.6.4
+	github.com/google/go-attestation v0.4.4-0.20230310182828-270ecbab1f21
 	github.com/samber/lo v1.38.1
 	github.com/samber/mo v1.8.0
 	go.uber.org/zap v1.24.0
@@ -42,7 +43,10 @@ require (
 	github.com/golang/protobuf v1.5.3 // indirect
 	github.com/golang/snappy v0.0.4 // indirect
 	github.com/google/cel-go v0.14.0 // indirect
-	github.com/google/pprof v0.0.0-20210407192527-94a9f03dee38 // indirect
+	github.com/google/certificate-transparency-go v1.1.4 // indirect
+	github.com/google/go-tpm v0.3.3 // indirect
+	github.com/google/go-tspi v0.3.0 // indirect
+	github.com/google/pprof v0.0.0-20210720184732-4bb14d4b1be1 // indirect
 	github.com/google/uuid v1.3.0 // indirect
 	github.com/huandu/xstrings v1.4.0 // indirect
 	github.com/imdario/mergo v0.3.15 // indirect

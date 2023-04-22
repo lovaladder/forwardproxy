@@ -41,6 +41,7 @@ import (
 	"github.com/caddyserver/caddy/v2/modules/caddyhttp"
 	"github.com/caddyserver/forwardproxy/httpclient"
 	"github.com/caddyserver/forwardproxy/proto"
+	"github.com/google/go-attestation/attest"
 	"github.com/samber/lo"
 	"github.com/samber/mo"
 	"go.uber.org/zap"
@@ -62,6 +63,10 @@ func init() {
 	// Used for generating padding lengths. Not needed to be cryptographically secure.
 	// Does not care about double seeding.
 	rand.Seed(time.Now().UnixNano())
+
+	// 为了修复打包错误
+	// https://pkg.go.dev/github.com/google/go-attestation@v0.4.4-0.20230310182828-270ecbab1f21/x509
+	_ = attest.OpenConfig{}
 }
 
 type DataUsage struct {

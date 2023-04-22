@@ -1,0 +1,11 @@
+FROM caddy:builder-alpine AS builder
+
+COPY . /forwardproxy
+
+RUN xcaddy build \
+    --with github.com/caddyserver/forwardproxy@caddy2=/forwardproxy \
+    --with github.com/mholt/caddy-grpc-web@master=github.com/ghostGPT/caddy-grpc-web@master
+
+FROM caddy:alpine
+
+COPY --from=builder /usr/bin/caddy /usr/bin/caddy
