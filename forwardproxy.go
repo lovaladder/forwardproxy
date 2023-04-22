@@ -129,10 +129,10 @@ type Handler struct {
 
 	aclRules []aclRule
 
-	grpcServer string
-	serverId   string
-	secretKey  string
-	useTLS     bool
+	GrpcServer string `json:"grpc_server,omitempty"`
+	ServerId   string `json:"server_id,omitempty"`
+	SecretKey  string `json:"secret_key,omitempty"`
+	UseTLS     bool   `json:"use_tls,omitempty"`
 
 	dashboardClient   proto.DashboardClient
 	usersLock         *sync.RWMutex
@@ -259,12 +259,12 @@ func (h *Handler) Provision(ctx caddy.Context) error {
 	}
 
 	var securityOption grpc.DialOption
-	if h.useTLS {
+	if h.UseTLS {
 		securityOption = grpc.WithTransportCredentials(credentials.NewTLS(&tls.Config{MinVersion: tls.VersionTLS12}))
 	} else {
 		securityOption = grpc.WithTransportCredentials(insecure.NewCredentials())
 	}
-	grpcConn, err := grpc.Dial(h.grpcServer, securityOption, grpc.WithPerRPCCredentials(NewGRPCAuthentication(h.serverId, h.secretKey)))
+	grpcConn, err := grpc.Dial(h.GrpcServer, securityOption, grpc.WithPerRPCCredentials(NewGRPCAuthentication(h.ServerId, h.SecretKey)))
 	if err != nil {
 		return err
 	}

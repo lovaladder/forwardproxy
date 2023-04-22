@@ -167,22 +167,22 @@ func (h *Handler) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 					if len(args) != 1 || args[0] == "" {
 						return d.Err("server directive expects a single non-empty argument")
 					}
-					h.grpcServer = args[0]
+					h.GrpcServer = args[0]
 				case "server_id":
 					if len(args) != 1 || args[0] == "" {
 						return d.Err("server_id directive expects a single non-empty argument")
 					}
-					h.serverId = args[0]
+					h.ServerId = args[0]
 				case "secret_key":
 					if len(args) != 1 || args[0] == "" {
 						return d.Err("secret_key directive expects a single non-empty argument")
 					}
-					h.secretKey = args[0]
+					h.SecretKey = args[0]
 				case "use_tls":
 					if len(args) != 0 {
 						return d.ArgErr()
 					}
-					h.useTLS = true
+					h.UseTLS = true
 				default:
 					return d.Err("expected acl directive: grpc/server_id/secret_key." +
 						"got: " + directive)
