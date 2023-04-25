@@ -271,6 +271,7 @@ func (h *Handler) innerReconnectDashboard() {
 	defer func() {
 		h.reconnecting = false
 	}()
+	time.Sleep(time.Second * 3) // wait a bit before reconnecting
 	h.logger.Info("Reconnecting to dashboard")
 
 	var securityOption grpc.DialOption
@@ -322,17 +323,12 @@ func (h *Handler) reconnectDashboard() {
 }
 
 func (h *Handler) reportDataUsage(ctx context.Context) {
-	h.logger.Info("Start reporting data usage")
+	h.logger.Info("Start reporting data usage v000")
 	defer func() {
 		h.reconnectCh <- struct{}{}
 	}()
 	defer h.logger.Info("Stop reporting data usage")
 
-	stream, err := h.dashboardClient.UsageStramingUpdate(ctx)
-	if err != nil {
-		h.logger.Error("Error report data usage init", zap.Error(err))
-		return
-	}
 	ticker := time.NewTicker(time.Second * 10)
 	defer ticker.Stop()
 	for {
@@ -353,14 +349,14 @@ func (h *Handler) reportDataUsage(ctx context.Context) {
 				h.dataUsageStat[userId] = 0
 			}
 			h.dataUsageStatLock.Unlock()
-			if len(list) > 0 {
-				h.logger.Info("Report data usage", zap.Int("count", len(list)))
-				err := stream.Send(&proto.RepeatedUsage{Usages: list})
-				if err != nil {
-					h.logger.Error("Error report data usage send", zap.Error(err))
-					return
-				}
+			h.logger.Info("Report data usage", zap.Int("count", len(list)))
+			// if len(list) > 0 {
+			_, err := h.dashboardClient.UsageStramingUpdate(ctx, &proto.RepeatedUsage{Usages: list})
+			if err != nil {
+				h.logger.Error("Error report data usage send", zap.Error(err))
+				return
 			}
+			// }
 		case data := <-h.dataUsageCh:
 			h.dataUsageStatLock.Lock()
 			if _, has := h.dataUsageStat[data.UserId]; has {
@@ -404,6 +400,7 @@ func (h *Handler) handleUsersUpdate(ctx context.Context) {
 				h.usersLock.RLock()
 				data, has := h.users[userId]
 				h.usersLock.RUnlock()
+
 				if !has {
 					// 新增用户
 					h.usersLock.Lock()
@@ -420,7 +417,7 @@ func (h *Handler) handleUsersUpdate(ctx context.Context) {
 				}
 				data.dataRemaining = dataRemaining
 				// 如果用户流量用完或密码发生了改变，踢出所有连接
-				if data.dataRemaining == 0 || data.authKey != userAuthKey {
+				if dataRemaining == 0 || data.authKey != userAuthKey {
 					data.connsLock.Lock()
 					for _, conns := range data.conns {
 						for _, conn := range conns {
@@ -437,7 +434,7 @@ func (h *Handler) handleUsersUpdate(ctx context.Context) {
 					data.connsLock.Unlock()
 				}
 				// 如果用户流量用完，删除用户
-				if data.dataRemaining == 0 {
+				if dataRemaining == 0 {
 					// 删除用户
 					h.usersLock.Lock()
 					h.dataUsageStatLock.Lock()
