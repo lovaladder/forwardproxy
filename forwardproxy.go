@@ -63,14 +63,27 @@ func init() {
 	_ = attest.OpenConfig{}
 }
 
+type ReaderWithReporter struct {
+	h      *Handler
+	userId string
+	inner  io.ReadCloser
+}
+
+func (r *ReaderWithReporter) Read(p []byte) (n int, err error) {
+	n, err = r.inner.Read(p)
+	if n > 0 {
+		err = r.h.logDataUsage(r.userId, uint64(n))
+	}
+	return
+}
+
+func (r *ReaderWithReporter) Close() error {
+	return r.inner.Close()
+}
+
 type DataUsage struct {
 	UserId string
 	Usage  uint64
-}
-
-type UserConn struct {
-	target net.Conn
-	client io.Writer
 }
 
 type UserData struct {
@@ -78,7 +91,7 @@ type UserData struct {
 	dataRemaining     uint64
 	authKey           string
 	connsLock         sync.Mutex
-	conns             map[string]map[string]UserConn
+	conns             map[string]map[string]io.ReadCloser
 }
 
 // Handler implements a forward proxy.
@@ -323,11 +336,17 @@ func (h *Handler) reconnectDashboard() {
 }
 
 func (h *Handler) reportDataUsage(ctx context.Context) {
-	h.logger.Info("Start reporting data usage v000")
+	h.logger.Info("Start reporting data usage")
 	defer func() {
 		h.reconnectCh <- struct{}{}
 	}()
 	defer h.logger.Info("Stop reporting data usage")
+
+	stream, err := h.dashboardClient.UsageStramingUpdate(ctx)
+	if err != nil {
+		h.logger.Error("Error connecting to dashboard", zap.Error(err))
+		return
+	}
 
 	ticker := time.NewTicker(time.Second * 10)
 	defer ticker.Stop()
@@ -350,13 +369,12 @@ func (h *Handler) reportDataUsage(ctx context.Context) {
 			}
 			h.dataUsageStatLock.Unlock()
 			h.logger.Info("Report data usage", zap.Int("count", len(list)))
-			// if len(list) > 0 {
-			_, err := h.dashboardClient.UsageStramingUpdate(ctx, &proto.RepeatedUsage{Usages: list})
-			if err != nil {
-				h.logger.Error("Error report data usage send", zap.Error(err))
-				return
+			if len(list) > 0 {
+				if err := stream.Send(&proto.RepeatedUsage{Usages: list}); err != nil {
+					h.logger.Error("Error report data usage send", zap.Error(err))
+					return
+				}
 			}
-			// }
 		case data := <-h.dataUsageCh:
 			h.dataUsageStatLock.Lock()
 			if _, has := h.dataUsageStat[data.UserId]; has {
@@ -408,7 +426,7 @@ func (h *Handler) handleUsersUpdate(ctx context.Context) {
 					h.users[userId] = &UserData{
 						dataRemaining: dataRemaining,
 						authKey:       userAuthKey,
-						conns:         make(map[string]map[string]UserConn),
+						conns:         make(map[string]map[string]io.ReadCloser),
 					}
 					h.dataUsageStat[userId] = 0
 					h.dataUsageStatLock.Unlock()
@@ -421,16 +439,10 @@ func (h *Handler) handleUsersUpdate(ctx context.Context) {
 					data.connsLock.Lock()
 					for _, conns := range data.conns {
 						for _, conn := range conns {
-							conn.target.Close()
-							if cw, ok := conn.client.(closeWriter); ok {
-								cw.CloseWrite()
-							}
-							if cw, ok := conn.client.(io.Closer); ok {
-								cw.Close()
-							}
+							conn.Close()
 						}
 					}
-					data.conns = make(map[string]map[string]UserConn)
+					data.conns = make(map[string]map[string]io.ReadCloser)
 					data.connsLock.Unlock()
 				}
 				// 如果用户流量用完，删除用户
@@ -513,6 +525,10 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 		}
 		ctxHeader.Add("Forwarded", "for=\""+r.RemoteAddr+"\"")
 		ctx = context.WithValue(ctx, httpclient.ContextKeyHeader{}, ctxHeader)
+	}
+
+	if err = h.logDataUsage(userAuthRet.MustGet(), countHttpRequestHeadLength(r)); err != nil {
+		return caddyhttp.Error(http.StatusForbidden, err)
 	}
 
 	if r.Method == http.MethodConnect {
@@ -617,6 +633,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 			}
 			r.Body, _ = r.GetBody()
 		}
+		r.Body = &ReaderWithReporter{h: h, inner: r.Body, userId: userAuthRet.MustGet()}
 		response, err = h.httpTransport.RoundTrip(r)
 	} else {
 		// Upstream requests don't interact well with Transport: connections could always be
@@ -640,6 +657,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 			return caddyhttp.Error(http.StatusBadGateway,
 				fmt.Errorf("failed to write upstream request: %v", err))
 		}
+		r.Body = &ReaderWithReporter{h: h, inner: r.Body, userId: userAuthRet.MustGet()}
 		response, err = http.ReadResponse(bufio.NewReader(upsConn), r)
 		if err != nil {
 			return caddyhttp.Error(http.StatusBadGateway,
@@ -659,7 +677,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 			fmt.Errorf("failed to read response: %v", err))
 	}
 
-	return forwardResponse(w, response)
+	return h.forwardResponse(userAuthRet.MustGet(), r.RemoteAddr, w, response)
 }
 
 func (h *Handler) checkCredentials(r *http.Request) mo.Result[string] {
@@ -867,41 +885,45 @@ const (
 	NumFirstPaddings = 8
 )
 
-// Copies data target->clientReader and clientWriter->target, and flushes as needed
-// Returns when clientWriter-> target stream is done.
-// Caddy should finish writing target -> clientReader.
-func (h *Handler) dualStream(userId string, remoteAddr string, target net.Conn, clientReader io.ReadCloser, clientWriter io.Writer, padding bool) error {
-	// 新链接
+// onConnetionOpen 新链接
+func (h *Handler) onConnetionOpen(userId, remoteAddr string, target io.ReadCloser) error {
 	h.usersLock.RLock()
+	defer h.usersLock.RUnlock()
 	user, ok := h.users[userId]
-	h.usersLock.RUnlock()
 	if !ok {
 		target.Close()
-		if cw, ok := clientWriter.(closeWriter); ok {
-			cw.CloseWrite()
-		}
 		return fmt.Errorf("user %s not found", userId)
 	}
 	user.connsLock.Lock()
+	defer user.connsLock.Unlock()
 	if _, has := user.conns[userId]; !has {
-		user.conns[userId] = make(map[string]UserConn)
+		user.conns[userId] = make(map[string]io.ReadCloser)
 	}
-	user.conns[userId][remoteAddr] = UserConn{
-		target: target,
-		client: clientWriter,
-	}
-	user.connsLock.Unlock()
+	user.conns[userId][remoteAddr] = target
+	return nil
+}
 
-	// 链接关闭
-	defer func() {
+// onConnetionClose 链接关闭
+func (h *Handler) onConnetionClose(userId, remoteAddr string) {
+	h.usersLock.RLock()
+	defer h.usersLock.RUnlock()
+	if user := h.users[userId]; user != nil {
 		user.connsLock.Lock()
+		defer user.connsLock.Unlock()
 		delete(user.conns[userId], remoteAddr)
-		user.connsLock.Unlock()
-	}()
+	}
+}
+
+// Copies data target->clientReader and clientWriter->target, and flushes as needed
+// Returns when clientWriter-> target stream is done.
+// Caddy should finish writing target -> clientReader.
+func (h *Handler) dualStream(userId, remoteAddr string, target net.Conn, clientReader io.ReadCloser, clientWriter io.Writer, padding bool) error {
+	h.onConnetionOpen(userId, remoteAddr, target)
+	defer h.onConnetionClose(userId, remoteAddr)
 
 	stream := func(w io.Writer, r io.Reader, paddingType int) error {
 		// copy bytes from r to w
-		buf := bufferPool.Get().([]byte)
+		buf := *bufferPool.Get().(*[]byte)
 		buf = buf[0:cap(buf)]
 		_, _err := h.flushingIoCopy(userId, w, r, buf, paddingType)
 		bufferPool.Put(&buf)
@@ -968,8 +990,9 @@ func (h *Handler) flushingIoCopy(userId string, dst io.Writer, src io.Reader, bu
 			}
 			if nw > 0 {
 				written += int64(nw)
-				// 扣减用户流量
-				h.logDataUsage(userId, uint64(nw))
+				if err = h.logDataUsage(userId, uint64(nw)); err != nil {
+					break
+				}
 			}
 			if ew != nil {
 				err = ew
@@ -991,7 +1014,10 @@ func (h *Handler) flushingIoCopy(userId string, dst io.Writer, src io.Reader, bu
 }
 
 // Removes hop-by-hop headers, and writes response into ResponseWriter.
-func forwardResponse(w http.ResponseWriter, response *http.Response) error {
+func (h *Handler) forwardResponse(userId, remoteAddr string, w http.ResponseWriter, response *http.Response) error {
+	h.onConnetionOpen(userId, remoteAddr, response.Body)
+	defer h.onConnetionClose(userId, remoteAddr)
+
 	w.Header().Del("Server") // remove Server: Caddy, append via instead
 	w.Header().Add("Via", strconv.Itoa(response.ProtoMajor)+"."+strconv.Itoa(response.ProtoMinor)+" caddy")
 
@@ -1002,9 +1028,9 @@ func forwardResponse(w http.ResponseWriter, response *http.Response) error {
 	}
 	removeHopByHop(w.Header())
 	w.WriteHeader(response.StatusCode)
-	buf := bufferPool.Get().([]byte)
+	buf := *bufferPool.Get().(*[]byte)
 	buf = buf[0:cap(buf)]
-	_, err := io.CopyBuffer(w, response.Body, buf)
+	_, err := h.CopyBufferObserve(userId, w, response.Body, buf)
 	bufferPool.Put(&buf)
 	return err
 }
@@ -1041,7 +1067,8 @@ function FindProxyForURL(url, host) {
 
 var bufferPool = sync.Pool{
 	New: func() interface{} {
-		return make([]byte, 0, 64*1024)
+		buf := make([]byte, 0, 64*1024)
+		return &buf
 	},
 }
 
@@ -1076,6 +1103,74 @@ func readLinesFromFile(filename string) ([]string, error) {
 	}
 
 	return hostnames, scanner.Err()
+}
+
+func countHttpRequestHeadLength(r *http.Request) uint64 {
+	var length uint64
+	length += uint64(len(r.Method))
+	length += uint64(len(r.URL.String()))
+	length += uint64(len(r.Proto))
+	length += 2 // CRLF
+	for k, v := range r.Header {
+		length += uint64(len(k))
+		length += uint64(len(v))
+		length += 4 // ": " + CRLF
+	}
+	length += 2 // CRLF
+	return length
+}
+
+func (h *Handler) CopyBufferObserve(userId string, dst io.Writer, src io.Reader, buf []byte) (written int64, err error) {
+	if buf != nil && len(buf) == 0 {
+		panic("empty buffer in CopyBuffer")
+	}
+	return h.copyBuffer(userId, dst, src, buf)
+}
+
+func (h *Handler) copyBuffer(userId string, dst io.Writer, src io.Reader, buf []byte) (written int64, err error) {
+	if buf == nil {
+		size := 32 * 1024
+		if l, ok := src.(*io.LimitedReader); ok && int64(size) > l.N {
+			if l.N < 1 {
+				size = 1
+			} else {
+				size = int(l.N)
+			}
+		}
+		buf = make([]byte, size)
+	}
+	for {
+		nr, er := src.Read(buf)
+		if nr > 0 {
+			nw, ew := dst.Write(buf[0:nr])
+			if nw < 0 || nr < nw {
+				nw = 0
+				if ew == nil {
+					ew = errors.New("net: invalid Write result")
+				}
+			}
+			written += int64(nw)
+			// 扣减用户流量
+			if err = h.logDataUsage(userId, uint64(nw)); err != nil {
+				break
+			}
+			if ew != nil {
+				err = ew
+				break
+			}
+			if nr != nw {
+				err = io.ErrShortWrite
+				break
+			}
+		}
+		if er != nil {
+			if er != io.EOF {
+				err = er
+			}
+			break
+		}
+	}
+	return written, err
 }
 
 // Interface guards

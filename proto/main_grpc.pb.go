@@ -28,7 +28,7 @@ const (
 // For semantics around ctx use and closing/ending streaming RPCs, please refer to https://pkg.go.dev/google.golang.org/grpc/?tab=doc#ClientConn.NewStream.
 type DashboardClient interface {
 	UserStramingUpdate(ctx context.Context, in *Empty, opts ...grpc.CallOption) (Dashboard_UserStramingUpdateClient, error)
-	UsageStramingUpdate(ctx context.Context, in *RepeatedUsage, opts ...grpc.CallOption) (*Empty, error)
+	UsageStramingUpdate(ctx context.Context, opts ...grpc.CallOption) (Dashboard_UsageStramingUpdateClient, error)
 }
 
 type dashboardClient struct {
@@ -71,13 +71,38 @@ func (x *dashboardUserStramingUpdateClient) Recv() (*RepeatedUser, error) {
 	return m, nil
 }
 
-func (c *dashboardClient) UsageStramingUpdate(ctx context.Context, in *RepeatedUsage, opts ...grpc.CallOption) (*Empty, error) {
-	out := new(Empty)
-	err := c.cc.Invoke(ctx, Dashboard_UsageStramingUpdate_FullMethodName, in, out, opts...)
+func (c *dashboardClient) UsageStramingUpdate(ctx context.Context, opts ...grpc.CallOption) (Dashboard_UsageStramingUpdateClient, error) {
+	stream, err := c.cc.NewStream(ctx, &Dashboard_ServiceDesc.Streams[1], Dashboard_UsageStramingUpdate_FullMethodName, opts...)
 	if err != nil {
 		return nil, err
 	}
-	return out, nil
+	x := &dashboardUsageStramingUpdateClient{stream}
+	return x, nil
+}
+
+type Dashboard_UsageStramingUpdateClient interface {
+	Send(*RepeatedUsage) error
+	CloseAndRecv() (*Empty, error)
+	grpc.ClientStream
+}
+
+type dashboardUsageStramingUpdateClient struct {
+	grpc.ClientStream
+}
+
+func (x *dashboardUsageStramingUpdateClient) Send(m *RepeatedUsage) error {
+	return x.ClientStream.SendMsg(m)
+}
+
+func (x *dashboardUsageStramingUpdateClient) CloseAndRecv() (*Empty, error) {
+	if err := x.ClientStream.CloseSend(); err != nil {
+		return nil, err
+	}
+	m := new(Empty)
+	if err := x.ClientStream.RecvMsg(m); err != nil {
+		return nil, err
+	}
+	return m, nil
 }
 
 // DashboardServer is the server API for Dashboard service.
@@ -85,7 +110,7 @@ func (c *dashboardClient) UsageStramingUpdate(ctx context.Context, in *RepeatedU
 // for forward compatibility
 type DashboardServer interface {
 	UserStramingUpdate(*Empty, Dashboard_UserStramingUpdateServer) error
-	UsageStramingUpdate(context.Context, *RepeatedUsage) (*Empty, error)
+	UsageStramingUpdate(Dashboard_UsageStramingUpdateServer) error
 	mustEmbedUnimplementedDashboardServer()
 }
 
@@ -96,8 +121,8 @@ type UnimplementedDashboardServer struct {
 func (UnimplementedDashboardServer) UserStramingUpdate(*Empty, Dashboard_UserStramingUpdateServer) error {
 	return status.Errorf(codes.Unimplemented, "method UserStramingUpdate not implemented")
 }
-func (UnimplementedDashboardServer) UsageStramingUpdate(context.Context, *RepeatedUsage) (*Empty, error) {
-	return nil, status.Errorf(codes.Unimplemented, "method UsageStramingUpdate not implemented")
+func (UnimplementedDashboardServer) UsageStramingUpdate(Dashboard_UsageStramingUpdateServer) error {
+	return status.Errorf(codes.Unimplemented, "method UsageStramingUpdate not implemented")
 }
 func (UnimplementedDashboardServer) mustEmbedUnimplementedDashboardServer() {}
 
@@ -133,22 +158,30 @@ func (x *dashboardUserStramingUpdateServer) Send(m *RepeatedUser) error {
 	return x.ServerStream.SendMsg(m)
 }
 
-func _Dashboard_UsageStramingUpdate_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
-	in := new(RepeatedUsage)
-	if err := dec(in); err != nil {
+func _Dashboard_UsageStramingUpdate_Handler(srv interface{}, stream grpc.ServerStream) error {
+	return srv.(DashboardServer).UsageStramingUpdate(&dashboardUsageStramingUpdateServer{stream})
+}
+
+type Dashboard_UsageStramingUpdateServer interface {
+	SendAndClose(*Empty) error
+	Recv() (*RepeatedUsage, error)
+	grpc.ServerStream
+}
+
+type dashboardUsageStramingUpdateServer struct {
+	grpc.ServerStream
+}
+
+func (x *dashboardUsageStramingUpdateServer) SendAndClose(m *Empty) error {
+	return x.ServerStream.SendMsg(m)
+}
+
+func (x *dashboardUsageStramingUpdateServer) Recv() (*RepeatedUsage, error) {
+	m := new(RepeatedUsage)
+	if err := x.ServerStream.RecvMsg(m); err != nil {
 		return nil, err
 	}
-	if interceptor == nil {
-		return srv.(DashboardServer).UsageStramingUpdate(ctx, in)
-	}
-	info := &grpc.UnaryServerInfo{
-		Server:     srv,
-		FullMethod: Dashboard_UsageStramingUpdate_FullMethodName,
-	}
-	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
-		return srv.(DashboardServer).UsageStramingUpdate(ctx, req.(*RepeatedUsage))
-	}
-	return interceptor(ctx, in, info, handler)
+	return m, nil
 }
 
 // Dashboard_ServiceDesc is the grpc.ServiceDesc for Dashboard service.
@@ -157,17 +190,17 @@ func _Dashboard_UsageStramingUpdate_Handler(srv interface{}, ctx context.Context
 var Dashboard_ServiceDesc = grpc.ServiceDesc{
 	ServiceName: "grpc.main.Dashboard",
 	HandlerType: (*DashboardServer)(nil),
-	Methods: []grpc.MethodDesc{
-		{
-			MethodName: "UsageStramingUpdate",
-			Handler:    _Dashboard_UsageStramingUpdate_Handler,
-		},
-	},
+	Methods:     []grpc.MethodDesc{},
 	Streams: []grpc.StreamDesc{
 		{
 			StreamName:    "UserStramingUpdate",
 			Handler:       _Dashboard_UserStramingUpdate_Handler,
 			ServerStreams: true,
+		},
+		{
+			StreamName:    "UsageStramingUpdate",
+			Handler:       _Dashboard_UsageStramingUpdate_Handler,
+			ClientStreams: true,
 		},
 	},
 	Metadata: "proto/main.proto",
