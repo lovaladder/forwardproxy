@@ -72,7 +72,7 @@ type ReaderWithReporter struct {
 func (r *ReaderWithReporter) Read(p []byte) (n int, err error) {
 	n, err = r.inner.Read(p)
 	if n > 0 {
-		err = r.h.logDataUsage(r.userId, uint64(n))
+		err = r.h.logDataUsage(r.userId, int64(n))
 	}
 	return
 }
@@ -83,12 +83,12 @@ func (r *ReaderWithReporter) Close() error {
 
 type DataUsage struct {
 	UserId string
-	Usage  uint64
+	Usage  int64
 }
 
 type UserData struct {
 	dataRemainingLock sync.Mutex
-	dataRemaining     uint64
+	dataRemaining     int64
 	authKey           string
 	connsLock         sync.Mutex
 	conns             map[string]map[string]io.ReadCloser
@@ -149,7 +149,7 @@ type Handler struct {
 	users               map[string]*UserData
 	dataUsageCh         chan DataUsage
 	dataUsageStatLock   *sync.Mutex
-	dataUsageStat       map[string]uint64
+	dataUsageStat       map[string]int64
 }
 
 // CaddyModule returns the Caddy module information.
@@ -167,7 +167,7 @@ func (h *Handler) Provision(ctx caddy.Context) error {
 	h.users = make(map[string]*UserData)
 	h.dataUsageCh = make(chan DataUsage, 2000)
 	h.dataUsageStatLock = new(sync.Mutex)
-	h.dataUsageStat = make(map[string]uint64)
+	h.dataUsageStat = make(map[string]int64)
 	h.reconnectCh = make(chan struct{})
 
 	if h.DialTimeout <= 0 {
@@ -208,7 +208,7 @@ func (h *Handler) Provision(ctx caddy.Context) error {
 	h.aclRules = append(h.aclRules, &aclAllRule{allow: true})
 
 	if h.ProbeResistance != nil && len(h.ProbeResistance.Domain) > 0 {
-		h.logger.Info("Secret domain used to connect to proxy: " + h.ProbeResistance.Domain)
+		h.logger.Debug("Secret domain used to connect to proxy: " + h.ProbeResistance.Domain)
 	}
 
 	dialer := &net.Dialer{
@@ -244,7 +244,7 @@ func (h *Handler) Provision(ctx caddy.Context) error {
 			if isLocalhost(h.upstream.Hostname()) && h.upstream.Scheme == "https" {
 				// disabling verification helps with testing the package and setups
 				// either way, it's impossible to have a legit TLS certificate for "127.0.0.1" - TODO: not true anymore
-				h.logger.Info("Localhost upstream detected, disabling verification of TLS certificate")
+				h.logger.Debug("Localhost upstream detected, disabling verification of TLS certificate")
 				d.DialTLS = func(network string, address string) (net.Conn, string, error) {
 					conn, err := tls.Dial(network, address, &tls.Config{InsecureSkipVerify: true})
 					if err != nil {
@@ -358,7 +358,7 @@ func (h *Handler) reportDataUsage(ctx context.Context) {
 			var list []*proto.Usage
 			h.dataUsageStatLock.Lock()
 			for userId, used := range h.dataUsageStat {
-				if used == 0 {
+				if used <= 0 {
 					continue
 				}
 				var usage proto.Usage
@@ -368,7 +368,7 @@ func (h *Handler) reportDataUsage(ctx context.Context) {
 				h.dataUsageStat[userId] = 0
 			}
 			h.dataUsageStatLock.Unlock()
-			h.logger.Info("Report data usage", zap.Int("count", len(list)))
+			h.logger.Debug("Report data usage", zap.Int("count", len(list)))
 			if len(list) > 0 {
 				if err := stream.Send(&proto.RepeatedUsage{Usages: list}); err != nil {
 					h.logger.Error("Error report data usage send", zap.Error(err))
@@ -403,7 +403,7 @@ func (h *Handler) handleUsersUpdate(ctx context.Context) {
 			return
 		}
 		users := msg.GetUsers()
-		h.logger.Info("Users update", zap.Any("users", users))
+		h.logger.Debug("Users update", zap.Any("users", users))
 
 		var wg sync.WaitGroup
 		wg.Add(len(users))
@@ -435,7 +435,7 @@ func (h *Handler) handleUsersUpdate(ctx context.Context) {
 				}
 				data.dataRemaining = dataRemaining
 				// 如果用户流量用完或密码发生了改变，踢出所有连接
-				if dataRemaining == 0 || data.authKey != userAuthKey {
+				if dataRemaining <= 0 || data.authKey != userAuthKey {
 					data.connsLock.Lock()
 					for _, conns := range data.conns {
 						for _, conn := range conns {
@@ -446,7 +446,7 @@ func (h *Handler) handleUsersUpdate(ctx context.Context) {
 					data.connsLock.Unlock()
 				}
 				// 如果用户流量用完，删除用户
-				if dataRemaining == 0 {
+				if dataRemaining <= 0 {
 					// 删除用户
 					h.usersLock.Lock()
 					h.dataUsageStatLock.Lock()
@@ -463,7 +463,7 @@ func (h *Handler) handleUsersUpdate(ctx context.Context) {
 	}
 }
 
-func (h *Handler) logDataUsage(userId string, dataUsed uint64) error {
+func (h *Handler) logDataUsage(userId string, dataUsed int64) error {
 	h.usersLock.RLock()
 	defer h.usersLock.RUnlock()
 	user, ok := h.users[userId]
@@ -697,7 +697,7 @@ func (h *Handler) checkCredentials(r *http.Request) mo.Result[string] {
 			defer h.usersLock.RUnlock()
 			data, has := h.users[userId]
 			if has && data.authKey == userAuthKey {
-				if data.dataRemaining == 0 {
+				if data.dataRemaining <= 0 {
 					return mo.Err[string](errors.New("user has no data remaining"))
 				}
 				return mo.Ok(userId)
@@ -990,7 +990,7 @@ func (h *Handler) flushingIoCopy(userId string, dst io.Writer, src io.Reader, bu
 			}
 			if nw > 0 {
 				written += int64(nw)
-				if err = h.logDataUsage(userId, uint64(nw)); err != nil {
+				if err = h.logDataUsage(userId, int64(nw)); err != nil {
 					break
 				}
 			}
@@ -1105,15 +1105,15 @@ func readLinesFromFile(filename string) ([]string, error) {
 	return hostnames, scanner.Err()
 }
 
-func countHttpRequestHeadLength(r *http.Request) uint64 {
-	var length uint64
-	length += uint64(len(r.Method))
-	length += uint64(len(r.URL.String()))
-	length += uint64(len(r.Proto))
+func countHttpRequestHeadLength(r *http.Request) int64 {
+	var length int64
+	length += int64(len(r.Method))
+	length += int64(len(r.URL.String()))
+	length += int64(len(r.Proto))
 	length += 2 // CRLF
 	for k, v := range r.Header {
-		length += uint64(len(k))
-		length += uint64(len(v))
+		length += int64(len(k))
+		length += int64(len(v))
 		length += 4 // ": " + CRLF
 	}
 	length += 2 // CRLF
@@ -1151,7 +1151,7 @@ func (h *Handler) copyBuffer(userId string, dst io.Writer, src io.Reader, buf []
 			}
 			written += int64(nw)
 			// 扣减用户流量
-			if err = h.logDataUsage(userId, uint64(nw)); err != nil {
+			if err = h.logDataUsage(userId, int64(nw)); err != nil {
 				break
 			}
 			if ew != nil {
