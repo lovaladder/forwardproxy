@@ -482,6 +482,7 @@ func (h *Handler) logDataUsage(userId string, dataUsed int64) error {
 }
 
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyhttp.Handler) error {
+	h.logger.Debug("ServeHTTP", zap.Any("header", r.Header))
 	// start by splitting the request host and port
 	reqHost, _, err := net.SplitHostPort(r.Host)
 	if err != nil {
@@ -492,7 +493,8 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 	if h.ProbeResistance != nil && len(h.ProbeResistance.Domain) > 0 && reqHost == h.ProbeResistance.Domain {
 		return serveHiddenPage(w, userAuthRet.Error())
 	}
-	if h.Hosts.Match(r) && (r.Method != http.MethodConnect || userAuthRet.IsError()) {
+	h.logger.Debug("checkCredentials", zap.Any("userAuthError", userAuthRet.Error()), zap.Any("check", h.Hosts.Match(r) && r.Method != http.MethodConnect))
+	if h.Hosts.Match(r) && r.Method != http.MethodConnect {
 		// Always pass non-CONNECT requests to hostname
 		// Pass CONNECT requests only if probe resistance is enabled and not authenticated
 		if h.shouldServePACFile(r) {
